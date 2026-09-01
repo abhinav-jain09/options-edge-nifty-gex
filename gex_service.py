@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 API_BASE = "https://api.dhan.co/v2"
@@ -43,6 +43,7 @@ SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 BOARDS_SPEC = os.environ.get(
     "DHAN_GEX_BOARDS", "nifty-gex:NIFTY:13:IDX_I,banknifty-gex:BANKNIFTY:25:IDX_I")
 FIXED_EXPIRY = os.environ.get("DHAN_GEX_EXPIRY", "")  # YYYY-MM-DD, applies to ALL boards
+ROLL_AFTER_IST = os.environ.get("DHAN_GEX_ROLL_AFTER_IST", "17:30")  # HH:MM IST, expiry-day rollover
 POLL_SECONDS = float(os.environ.get("DHAN_GEX_POLL_SECONDS", "3.5"))
 SPOT_POLL_SECONDS = float(os.environ.get("DHAN_GEX_SPOT_POLL_SECONDS", "1.1"))
 SPOT_FRESH_SECONDS = 15.0  # fall back to the chain's own last_price beyond this
@@ -168,11 +169,16 @@ def _renew_loop():
 
 
 def _active_expiry(board):
+    """Nearest unexpired expiry — where "expired" flips ROLL_AFTER_IST (default 17:30,
+    two hours past the 15:30 IST close) on the expiry day itself, so the board rolls to
+    the next expiry the same evening instead of waiting for midnight."""
     if FIXED_EXPIRY:
         return FIXED_EXPIRY
-    today = date.today().isoformat()
+    ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today = ist.date().isoformat()
+    past_cutoff = ist.strftime("%H:%M") >= ROLL_AFTER_IST
     for exp in board["expiries"]:
-        if exp >= today:
+        if exp > today or (exp == today and not past_cutoff):
             return exp
     return board["expiries"][-1] if board["expiries"] else None
 
