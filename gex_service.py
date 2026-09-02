@@ -19,6 +19,7 @@ defaults to 1.
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -59,6 +60,7 @@ _boards = []   # [{key,name,scrip,seg, chain,snapshot,expiries,expiries_on,error
 _spots = {}    # scrip -> (price, monotonic-ts)
 _spot_error = None
 _auth_failed = False  # a poller saw 401 — renew loop reacts on its next tick
+_outage_since = None  # epoch of the first upstream failure since the last success
 _renewed_at = None
 _renew_error = None
 _secret_written_at = None
@@ -75,7 +77,14 @@ def _parse_boards():
     return boards
 
 
+def _clean_err(prefix, body):
+    """Human-sized error text: strip the vendor's HTML error pages down to words."""
+    text = " ".join(re.sub(r"<[^>]+>", " ", body or "").split())[:100]
+    return f"{prefix}: {text}" if text else prefix
+
+
 def _api_post(path, body):
+    global _outage_since
     req = urllib.request.Request(
         API_BASE + path,
         data=json.dumps(body).encode(),
@@ -87,8 +96,19 @@ def _api_post(path, body):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # 5xx = Dhan's side is down; 4xx (401/429/…) means it answered — not an outage.
+        if e.code >= 500 and _outage_since is None:
+            _outage_since = time.time()
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError):
+        if _outage_since is None:
+            _outage_since = time.time()
+        raise
+    _outage_since = None  # upstream answered — outage over (even if it rejects the request)
     if payload.get("status") != "success":
         raise RuntimeError(f"API status={payload.get('status')}: {str(payload)[:200]}")
     return payload["data"]
@@ -308,7 +328,7 @@ def _chain_loop():
             except Exception:
                 pass
             with _lock:
-                board["error"] = f"HTTP {e.code}: {body}"
+                board["error"] = _clean_err(f"HTTP {e.code}", body)
             if e.code == 401:
                 _auth_failed = True
             if e.code == 429:
@@ -372,6 +392,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _outage_fields(self):
+        if _outage_since is None:
+            return {"upstreamDownSince": None, "upstreamOutageSeconds": None}
+        return {
+            "upstreamDownSince": datetime.fromtimestamp(_outage_since, timezone.utc).isoformat(timespec="seconds"),
+            "upstreamOutageSeconds": round(time.time() - _outage_since, 1),
+        }
+
     def _board_health(self, board):
         with _lock:
             snap, err, sperr = board["snapshot"], board["error"], _spot_error
@@ -389,6 +417,7 @@ class Handler(BaseHTTPRequestHandler):
             "renewError": _renew_error,
             "secretWrittenAt": _secret_written_at,
             "secretError": _secret_error,
+            **self._outage_fields(),
         }))
 
     def _board_gex(self, board):
@@ -400,6 +429,7 @@ class Handler(BaseHTTPRequestHandler):
             out = dict(snap)
             out["lastError"] = err
             out["spotError"] = sperr
+            out.update(self._outage_fields())
             self._send(200, json.dumps(out))
 
     def do_GET(self):
@@ -452,6 +482,7 @@ tr.flip td{background:#1f2a1f}
 .bpos{position:absolute;left:50%;background:#3fb950;height:11px;top:1px;border-radius:0 2px 2px 0}
 .bneg{position:absolute;right:50%;background:#f85149;height:11px;top:1px;border-radius:2px 0 0 2px}
 #err{color:#f85149;margin:8px 0}
+.badge{background:#f85149;color:#fff;padding:2px 9px;border-radius:10px;font-weight:600;font-size:11px;letter-spacing:.04em;margin-right:8px}
 </style></head><body>
 <h1 id="title">__NAME__ Pressure</h1>
 <div id="meta">loading…</div>
@@ -468,7 +499,15 @@ async function tick(){
  try{
   const r=await fetch("gex");const d=await r.json();
   if(!r.ok){document.getElementById("err").textContent=d.error||"error";return}
-  document.getElementById("err").textContent=d.lastError?("last poll error: "+d.lastError+" (showing last good data)"):"";
+  const err=document.getElementById("err");err.textContent="";
+  if(d.upstreamOutageSeconds!=null){
+   const s=d.upstreamOutageSeconds,dur=s>=90?Math.round(s/60)+" min":Math.round(s)+" s";
+   const b=document.createElement("span");b.className="badge";b.textContent="DHAN UPSTREAM DOWN";
+   err.appendChild(b);
+   err.appendChild(document.createTextNode("for "+dur+" — showing last good data"));
+  }else if(d.lastError){
+   err.textContent="last poll error: "+d.lastError+" (showing last good data)";
+  }
   document.getElementById("title").textContent=d.underlying+" Pressure — "+d.expiry;
   document.getElementById("meta").textContent="spot "+fmt(d.spot)+
     (d.spotSource==="quote"?" (live 1s quote)":" (from chain)")+
