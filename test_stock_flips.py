@@ -88,7 +88,9 @@ check("knife edge ranks by |net|/gross and needs the stricter floor",
 
 # --- universe file ---------------------------------------------------------------------
 u = sf.load_universe()
-check("universe parses to 50 NIFTY stocks", len(u) == 50)
+# The count is the OWNER's to change (growth names only since 2026-09-04) — assert the file
+# parses and is non-trivial, not a membership number that his edits would break.
+check("universe parses and is non-trivial", 10 <= len(u) <= 210)
 check("symbols with & and - parse (M&M, BAJAJ-AUTO)",
       any(s == "M&M" for s, _ in u) and any(s == "BAJAJ-AUTO" for s, _ in u))
 
