@@ -28,6 +28,8 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import stock_flips
+
 API_BASE = "https://api.dhan.co/v2"
 
 ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "")  # rotated in place by _renew_loop
@@ -50,6 +52,11 @@ SPOT_POLL_SECONDS = float(os.environ.get("DHAN_GEX_SPOT_POLL_SECONDS", "1.1"))
 SPOT_FRESH_SECONDS = 15.0  # fall back to the chain's own last_price beyond this
 OI_MULTIPLIER = float(os.environ.get("DHAN_GEX_OI_MULTIPLIER", "1"))
 PORT = int(os.environ.get("DHAN_GEX_PORT", "8188"))
+# NIFTY stock flip levels: sweep the stock_universe.txt chains on ALTERNATE chain ticks
+# (index boards keep every other slot → their refresh halves to ~4*POLL_SECONDS each; a
+# 50-stock sweep completes in ~50*2*POLL_SECONDS ≈ 6 min — flip levels move slowly).
+STOCK_FLIPS_ENABLED = os.environ.get("DHAN_GEX_STOCK_FLIPS_ENABLED", "true").lower() == "true"
+STOCK_SEG = os.environ.get("DHAN_GEX_STOCK_SEG", "NSE_EQ")
 BIND = os.environ.get("DHAN_GEX_BIND", "127.0.0.1")
 WALL_BAND_PCT = float(os.environ.get("DHAN_GEX_WALL_BAND_PCT", "5"))
 
@@ -57,6 +64,9 @@ CRORE = 1e7
 
 _lock = threading.Lock()
 _boards = []   # [{key,name,scrip,seg, chain,snapshot,expiries,expiries_on,error}]
+_stock_universe = []   # [(symbol, scrip)] from stock_universe.txt when the scan is enabled
+_stock_state = {}      # symbol -> {expiries, expiries_on, spot, rows, expiry, asOf, error}
+_flips = None          # latest stock_flips.flip_scan result
 _spots = {}    # scrip -> (price, monotonic-ts)
 _spot_error = None
 _auth_failed = False  # a poller saw 401 — renew loop reacts on its next tick
@@ -188,19 +198,23 @@ def _renew_loop():
             _renew_error = f"{type(e).__name__}: {e}"
 
 
-def _active_expiry(board):
+def _first_unexpired(expiries):
     """Nearest unexpired expiry — where "expired" flips ROLL_AFTER_IST (default 17:30,
-    two hours past the 15:30 IST close) on the expiry day itself, so the board rolls to
+    two hours past the 15:30 IST close) on the expiry day itself, so a board rolls to
     the next expiry the same evening instead of waiting for midnight."""
-    if FIXED_EXPIRY:
-        return FIXED_EXPIRY
     ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     today = ist.date().isoformat()
     past_cutoff = ist.strftime("%H:%M") >= ROLL_AFTER_IST
-    for exp in board["expiries"]:
+    for exp in expiries:
         if exp > today or (exp == today and not past_cutoff):
             return exp
-    return board["expiries"][-1] if board["expiries"] else None
+    return expiries[-1] if expiries else None
+
+
+def _active_expiry(board):
+    if FIXED_EXPIRY:
+        return FIXED_EXPIRY
+    return _first_unexpired(board["expiries"])
 
 
 def _compute(board, expiry, data, spot, spot_source, chain_asof):
@@ -295,12 +309,62 @@ def _rebuild(board):
         board["snapshot"] = snap
 
 
+def _stock_tick(i):
+    """One stock's turn on the chain budget: refresh its expiry list (a tick of its own,
+    daily) or its chain, then rebuild the flip scan. Returns the next stock index."""
+    global _flips, _auth_failed
+    sym, scrip = _stock_universe[i % len(_stock_universe)]
+    st = _stock_state.setdefault(sym, {})
+    try:
+        if not st.get("expiries") or st.get("expiries_on") != date.today():
+            data = _api_post("/optionchain/expirylist",
+                             {"UnderlyingScrip": scrip, "UnderlyingSeg": STOCK_SEG})
+            st["expiries"] = sorted(data)
+            st["expiries_on"] = date.today()
+            return i  # the list consumed this tick's budget; chain on this stock's next turn
+        expiry = _first_unexpired(st["expiries"])
+        if not expiry:
+            raise RuntimeError("no expiry available")
+        data = _api_post("/optionchain",
+                         {"UnderlyingScrip": scrip, "UnderlyingSeg": STOCK_SEG, "Expiry": expiry})
+        spot = float(data["last_price"])
+        st.update(spot=spot, rows=stock_flips.board_rows(data, spot), expiry=expiry,
+                  asOf=datetime.now(timezone.utc).isoformat(timespec="seconds"), error=None)
+        scan = stock_flips.flip_scan(_stock_state)
+        scan["universeSize"] = len(_stock_universe)
+        scan["asOf"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with _lock:
+            _flips = scan
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            pass
+        st["error"] = _clean_err(f"HTTP {e.code}", body)
+        if e.code == 401:
+            _auth_failed = True
+        if e.code == 429:
+            time.sleep(10)
+    except Exception as e:
+        st["error"] = f"{type(e).__name__}: {e}"
+    return i + 1
+
+
 def _chain_loop():
-    """Round-robin the option-chain budget (1 unique request / 3 s, per ACCOUNT) over
-    all boards: with N boards each refreshes every N*POLL_SECONDS."""
+    """Round-robin the option-chain budget (1 unique request / 3 s, per ACCOUNT): index
+    boards take every other tick, the stock flip sweep fills the rest."""
     global _auth_failed
     idx = 0
+    stock_idx = 0
+    tick = 0
     while True:
+        take_stock = _stock_universe and tick % 2 == 1
+        tick += 1
+        if take_stock:
+            stock_idx = _stock_tick(stock_idx)
+            time.sleep(POLL_SECONDS)
+            continue
         board = _boards[idx % len(_boards)]
         idx += 1
         try:
@@ -432,8 +496,35 @@ class Handler(BaseHTTPRequestHandler):
             out.update(self._outage_fields())
             self._send(200, json.dumps(out))
 
+    def _stock_flips(self):
+        with _lock:
+            snap = _flips
+        if not snap:
+            self._send(503, json.dumps({"error": "no stocks scanned yet"}))
+            return
+        out = dict(snap)
+        out.update(self._outage_fields())
+        self._send(200, json.dumps(out))
+
+    def _stock_flips_health(self):
+        scanned = sum(1 for st in _stock_state.values() if st.get("rows"))
+        errors = {s: st["error"] for s, st in _stock_state.items() if st.get("error")}
+        self._send(200 if scanned else 503, json.dumps({
+            "status": "ok" if scanned and not errors else ("degraded" if scanned else "down"),
+            "universe": len(_stock_universe),
+            "scanned": scanned,
+            "errors": dict(list(errors.items())[:10]),
+            **self._outage_fields(),
+        }))
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/stock-flips/flips":
+            self._stock_flips()
+            return
+        if path == "/stock-flips/health":
+            self._stock_flips_health()
+            return
         board = _boards[0]
         sub = path
         for b in _boards:
@@ -540,11 +631,14 @@ tick();setInterval(tick,1000);
 
 
 def main():
-    global _boards
+    global _boards, _stock_universe
     if not ACCESS_TOKEN or not CLIENT_ID:
         print("DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID must be set", file=sys.stderr)
         sys.exit(1)
     _boards = _parse_boards()
+    if STOCK_FLIPS_ENABLED:
+        _stock_universe = stock_flips.load_universe()
+        print(f"stock flip sweep enabled: {len(_stock_universe)} names", flush=True)
     threading.Thread(target=_chain_loop, daemon=True).start()
     threading.Thread(target=_spot_loop, daemon=True).start()
     threading.Thread(target=_renew_loop, daemon=True).start()
