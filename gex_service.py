@@ -328,7 +328,9 @@ def _stock_tick(i):
         data = _api_post("/optionchain",
                          {"UnderlyingScrip": scrip, "UnderlyingSeg": STOCK_SEG, "Expiry": expiry})
         spot = float(data["last_price"])
-        st.update(spot=spot, rows=stock_flips.board_rows(data, spot), expiry=expiry,
+        detail = stock_flips.board_detail(data, spot)
+        st.update(spot=spot, detail=detail,
+                  rows=[(r["strike"], r["netGexCr"]) for r in detail], expiry=expiry,
                   asOf=datetime.now(timezone.utc).isoformat(timespec="seconds"), error=None)
         scan = stock_flips.flip_scan(_stock_state)
         scan["universeSize"] = len(_stock_universe)
@@ -506,6 +508,48 @@ class Handler(BaseHTTPRequestHandler):
         out.update(self._outage_fields())
         self._send(200, json.dumps(out))
 
+    def _stock_board(self, symbol):
+        """One stock's board in the INDEX BOARDS' schema, so the pressure page's renderer
+        opens it unchanged. Spot/greeks are as fresh as the stock's last sweep turn."""
+        st = _stock_state.get(symbol)
+        if st is None:
+            self._send(404, json.dumps({"error": "no such stock in the universe"}))
+            return
+        detail = st.get("detail")
+        spot = st.get("spot")
+        if not detail or not spot:
+            self._send(503, json.dumps(
+                {"error": f"{symbol} not swept yet — a full pass takes ~6 minutes"}))
+            return
+        rows = [(r["strike"], r["netGexCr"]) for r in detail]
+        band = spot * WALL_BAND_PCT / 100
+        near = [r for r in detail if abs(r["strike"] - spot) <= band] or detail
+        with _lock:
+            sperr = _spot_error
+        out = {
+            "underlying": symbol,
+            "expiry": st.get("expiry"),
+            "spot": spot,
+            "spotSource": "chain",
+            "chainAsOf": st.get("asOf"),
+            "asOf": st.get("asOf"),
+            "oiMultiplier": OI_MULTIPLIER,
+            "totals": {
+                "callGexCr": round(sum(r["callGexCr"] for r in detail), 2),
+                "putGexCr": round(sum(r["putGexCr"] for r in detail), 2),
+                "netGexCr": round(sum(r["netGexCr"] for r in detail), 2),
+            },
+            "zeroGammaLevel": stock_flips.nearest_crossing(rows, spot),
+            "callWall": max(near, key=lambda r: r["callGexCr"])["strike"],
+            "putWall": min(near, key=lambda r: r["putGexCr"])["strike"],
+            "strikeCount": len(detail),
+            "strikes": detail,
+            "lastError": st.get("error"),
+            "spotError": sperr,
+        }
+        out.update(self._outage_fields())
+        self._send(200, json.dumps(out))
+
     def _stock_flips_health(self):
         scanned = sum(1 for st in _stock_state.values() if st.get("rows"))
         errors = {s: st["error"] for s, st in _stock_state.items() if st.get("error")}
@@ -524,6 +568,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/stock-flips/health":
             self._stock_flips_health()
+            return
+        if path.startswith("/stock-flips/board/"):
+            import urllib.parse
+            self._stock_board(urllib.parse.unquote(path[len("/stock-flips/board/"):]).upper())
             return
         board = _boards[0]
         sub = path

@@ -40,9 +40,15 @@ chain = {"oc": {
 rows = sf.board_rows(chain, spot=100.0)
 check("board_rows keeps only priced strikes with OI",
       len(rows) == 1 and rows[0][0] == 100.0)
-# net = (0.02*1000 - 0.01*500) * 100^2 * 0.01 / 1e7 = 15 * 100 / 1e7
+# net = (0.02*1000 - 0.01*500) * 100^2 * 0.01 / 1e7 = 0.00015 — which sits exactly ON the
+# 4dp rounding edge, so compare against the unrounded value with a tolerance wider than
+# the rounding step rather than re-rounding (float repr makes the two paths round apart).
 check("board_rows net matches the index-board formula",
-      abs(rows[0][1] - (15 * 100 / 1e7)) < 1e-12)
+      abs(rows[0][1] - 15 * 100 / 1e7) <= 6e-5)
+detail = sf.board_detail(chain, spot=100.0)
+check("board_detail carries the index-board wire shape",
+      set(detail[0]) == {"strike", "callOi", "putOi", "callGexCr", "putGexCr",
+                         "netGexCr", "cumNetGexCr"})
 
 
 # --- flip_scan admissions --------------------------------------------------------------

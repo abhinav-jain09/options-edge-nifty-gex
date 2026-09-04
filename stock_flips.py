@@ -58,11 +58,11 @@ def load_universe(path=UNIVERSE_FILE):
     return entries
 
 
-def board_rows(chain_data, spot, crore=1e7):
-    """Per-strike net pressure (₹Cr per 1% move) from one Dhan chain — [(strike, net)], ascending.
-
-    Same convention as the index boards: calls positive, puts negative, OI in underlying
-    units (lot already included).
+def board_detail(chain_data, spot, crore=1e7):
+    """Per-strike detail from one Dhan chain, in the INDEX BOARDS' wire shape (callGexCr/
+    putGexCr/netGexCr keys — the pressure pages' existing renderer reads exactly these, so
+    a stock board opens in the same bar view; the legacy key spelling is the wire contract,
+    not page vocabulary). ₹Cr per 1% move, ascending strikes.
     """
     scale = spot * spot * 0.01 / crore
     rows = []
@@ -80,10 +80,27 @@ def board_rows(chain_data, spot, crore=1e7):
         # feature cannot rename.
         call_curve = float((ce.get("greeks") or {}).get("gamma") or 0)
         put_curve = float((pe.get("greeks") or {}).get("gamma") or 0)
-        net = (call_curve * call_oi - put_curve * put_oi) * scale
-        rows.append((strike, net))
-    rows.sort(key=lambda r: r[0])
+        call = call_curve * call_oi * scale
+        put = -put_curve * put_oi * scale
+        rows.append({
+            "strike": strike,
+            "callOi": call_oi,
+            "putOi": put_oi,
+            "callGexCr": round(call, 4),
+            "putGexCr": round(put, 4),
+            "netGexCr": round(call + put, 4),
+        })
+    rows.sort(key=lambda r: r["strike"])
+    cum = 0.0
+    for r in rows:
+        cum += r["netGexCr"]
+        r["cumNetGexCr"] = round(cum, 4)
     return rows
+
+
+def board_rows(chain_data, spot, crore=1e7):
+    """The scan's view of a chain — [(strike, net)] ascending, derived from board_detail."""
+    return [(r["strike"], r["netGexCr"]) for r in board_detail(chain_data, spot, crore)]
 
 
 def nearest_crossing(rows, spot):
