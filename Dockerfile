@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY gex_service.py stock_flips.py stock_universe.txt .
+COPY gex_service.py stock_flips.py stock_universe.txt ./
 ENV DHAN_GEX_BIND=0.0.0.0 \
     PYTHONUNBUFFERED=1
 EXPOSE 8188
